@@ -2,20 +2,26 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
+[RequireComponent(typeof(CharacterController))]
 public class SimpleWalker : MonoBehaviour
 {
     [Header("Movement")]
-    public float moveSpeed = 4.0f;          // Walking speed
-    public bool sprintEnabled = false;      // Leave off; here just in case
-    public float sprintMultiplier = 1.6f;   // Used only if you flip sprintEnabled on later
+    public float moveSpeed = 4.0f;
+    public bool sprintEnabled = false;
+    public float sprintMultiplier = 1.6f;
 
-    [Header("Mouse Look")]
-    public Transform cameraPivot;           // Drag your Main Camera here
-    public float mouseSensitivity = 120f;   // Degrees/second per mouse delta
+    [Header("Look (Mouse + Controller)")]
+    public Transform cameraPivot;                 // Assign Main Camera
+    public float mouseSensitivity = 120f;         // degrees/sec from mouse delta
+    public float padLookSpeed = 180f;             // degrees/sec from right stick
     [Tooltip("How far the player can look down (negative).")]
     public float minPitch = -25f;
     [Tooltip("How far the player can look up (positive).")]
     public float maxPitch = 25f;
+
+    [Header("Look Smoothing (camera lag)")]
+    [Tooltip("Higher = snappier, Lower = more lag. 6–14 feels good.")]
+    public float lookSmoothing = 10f;             // interpolation strength
 
     [Header("Walk Wobble (Head Bob)")]
     [Tooltip("Vertical bob height. Keep tiny (0.005–0.04).")]
@@ -24,30 +30,40 @@ public class SimpleWalker : MonoBehaviour
     public float bobFrequency = 8f;
     [Tooltip("How strongly current speed affects the bobbing.")]
     public float bobSpeedInfluence = 1f;
+    [Tooltip("How fast the camera returns to rest when you stop.")]
+    public float bobReturnSpeed = 10f;
 
     [Header("Misc")]
     public bool lockCursor = true;
 
+    // Internals
     CharacterController controller;
-    float yaw;     // left-right rotation of the player body
-    float pitch;   // up-down rotation of the camera
+
+    // Target vs smoothed rotations (for camera lag)
+    float targetYaw;     // world yaw (player body)
+    float targetPitch;   // local pitch (camera)
+    float smoothedYaw;
+    float smoothedPitch;
+
     Vector3 camDefaultLocalPos;
     float bobTimer;
 
     void Awake()
     {
         controller = GetComponent<CharacterController>();
-        if (cameraPivot == null)
+
+        if (!cameraPivot)
         {
             Camera cam = GetComponentInChildren<Camera>();
             if (cam) cameraPivot = cam.transform;
         }
-        if (cameraPivot != null) camDefaultLocalPos = cameraPivot.localPosition;
+        if (cameraPivot) camDefaultLocalPos = cameraPivot.localPosition;
 
-        // Start yaw/pitch from current transforms
-        yaw = transform.eulerAngles.y;
-        if (cameraPivot != null) pitch = cameraPivot.localEulerAngles.x;
-        pitch = NormalizePitch(pitch);
+        // Initialize rotations
+        targetYaw = smoothedYaw = transform.eulerAngles.y;
+        float startPitch = cameraPivot ? cameraPivot.localEulerAngles.x : 0f;
+        startPitch = NormalizePitch(startPitch);
+        targetPitch = smoothedPitch = Mathf.Clamp(startPitch, minPitch, maxPitch);
 
         if (lockCursor)
         {
@@ -58,6 +74,7 @@ public class SimpleWalker : MonoBehaviour
 
     void Update()
     {
+        if (!controller) return;
         Look();
         Move();
         HeadBob();
@@ -65,56 +82,71 @@ public class SimpleWalker : MonoBehaviour
 
     void Look()
     {
-        // Mouse delta in "degrees per second" style feel
+        float dt = Time.deltaTime;
+
+        // Mouse deltas
         float mx = Input.GetAxis("Mouse X");
         float my = Input.GetAxis("Mouse Y");
 
-        yaw += mx * mouseSensitivity * Time.deltaTime;
-        pitch -= my * mouseSensitivity * Time.deltaTime; // invert to feel natural
+        // Gamepad right stick (safe even if axes aren't defined)
+        float rx = GetAxisSafe("Look X");
+        float ry = GetAxisSafe("Look Y");
 
-        pitch = Mathf.Clamp(pitch, minPitch, maxPitch);
+        // Combine mouse + pad
+        float yawDelta   = (mx * mouseSensitivity + rx * padLookSpeed) * dt;
+        float pitchDelta = (-my * mouseSensitivity + -ry * padLookSpeed) * dt;
 
-        // Apply rotations: body yaw, camera pitch
-        transform.rotation = Quaternion.Euler(0f, yaw, 0f);
-        if (cameraPivot != null)
-            cameraPivot.localRotation = Quaternion.Euler(pitch, 0f, 0f);
+        targetYaw   += yawDelta;
+        targetPitch += pitchDelta;
+        targetPitch = Mathf.Clamp(targetPitch, minPitch, maxPitch);
+
+        // Smooth toward target (exp smoothing, framerate-independent)
+        float t = 1f - Mathf.Exp(-lookSmoothing * dt);
+        smoothedYaw   = Mathf.LerpAngle(smoothedYaw, targetYaw, t);
+        smoothedPitch = Mathf.Lerp(smoothedPitch, targetPitch, t);
+
+        // Apply
+        transform.rotation = Quaternion.Euler(0f, smoothedYaw, 0f);
+        if (cameraPivot)
+            cameraPivot.localRotation = Quaternion.Euler(smoothedPitch, 0f, 0f);
     }
 
     void Move()
     {
-        // WASD relative to player’s yaw
-        float h = Input.GetAxisRaw("Horizontal");
-        float v = Input.GetAxisRaw("Vertical");
+        // Keyboard + left stick share these axes
+        float h = Input.GetAxis("Horizontal");
+        float v = Input.GetAxis("Vertical");
+
         Vector3 input = new Vector3(h, 0f, v);
         input = Vector3.ClampMagnitude(input, 1f);
 
         float speed = moveSpeed;
         if (sprintEnabled && Input.GetKey(KeyCode.LeftShift)) speed *= sprintMultiplier;
 
-        // CharacterController.SimpleMove applies gravity automatically
         Vector3 worldMove = transform.TransformDirection(input) * speed;
-        controller.SimpleMove(worldMove);
+        controller.SimpleMove(worldMove); // includes gravity
     }
 
     void HeadBob()
     {
-        if (cameraPivot == null) return;
+        if (!cameraPivot) return;
 
-        // Bob only while moving on ground
-        Vector3 horizontalVel = controller.velocity; horizontalVel.y = 0f;
-        float moveMagnitude = horizontalVel.magnitude;
+        Vector3 vel = controller.velocity; vel.y = 0f;
+        float speed = vel.magnitude;
 
-        if (moveMagnitude > 0.05f && controller.isGrounded)
+        if (speed > 0.05f && controller.isGrounded)
         {
-            bobTimer += Time.deltaTime * (bobFrequency + moveMagnitude * bobSpeedInfluence * 0.1f);
+            bobTimer += Time.deltaTime * (bobFrequency + speed * bobSpeedInfluence * 0.1f);
             float offsetY = Mathf.Sin(bobTimer * Mathf.PI * 2f) * bobAmplitude;
-            cameraPivot.localPosition = camDefaultLocalPos + new Vector3(0f, offsetY, 0f);
+            Vector3 targetPos = camDefaultLocalPos + new Vector3(0f, offsetY, 0f);
+            // slight smoothing for nicer feel
+            cameraPivot.localPosition = Vector3.Lerp(cameraPivot.localPosition, targetPos, 0.35f);
         }
         else
         {
-            // Ease back to default when not moving
             bobTimer = 0f;
-            cameraPivot.localPosition = Vector3.Lerp(cameraPivot.localPosition, camDefaultLocalPos, 10f * Time.deltaTime);
+            cameraPivot.localPosition = Vector3.Lerp(
+                cameraPivot.localPosition, camDefaultLocalPos, bobReturnSpeed * Time.deltaTime);
         }
     }
 
@@ -123,5 +155,12 @@ public class SimpleWalker : MonoBehaviour
     {
         if (eulerX > 180f) eulerX -= 360f;
         return eulerX;
+    }
+
+    // Prevent crashes if custom axes aren't defined yet
+    float GetAxisSafe(string axisName)
+    {
+        try { return Input.GetAxis(axisName); }
+        catch (System.ArgumentException) { return 0f; }
     }
 }
